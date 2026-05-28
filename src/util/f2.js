@@ -39,12 +39,16 @@ export async function f2_uploadFile(filename) {
   if (!fs.existsSync(localPath))
     throw new Error(`Local file not found: ${localPath}`);
 
-  const uploader = new ftp.Client();
-  const watcher = new ftp.Client();
+  // basic-ftp default timeout is 30s. GitHub Actions runners can be slower,
+  // so large uploads may hit timeouts / connection resets.
+  const FTP_TIMEOUT_MS = Number(process.env.FTP_TIMEOUT_MS ?? 10 * 60 * 1000);
 
-  uploader.ftp.verbose = false;
-  uploader.ftp.passive = false;
-  watcher.ftp.verbose = false;
+  const uploader = new ftp.Client(FTP_TIMEOUT_MS);
+  const watcher = new ftp.Client(FTP_TIMEOUT_MS);
+
+  const verbose = process.env.FTP_VERBOSE === "1";
+  uploader.ftp.verbose = verbose;
+  watcher.ftp.verbose = verbose;
 
   const totalBytes = fs.statSync(localPath).size;
 
@@ -77,35 +81,65 @@ export async function f2_uploadFile(filename) {
     await uploader.cd(FTP_FOLDER);
     await watcher.cd(FTP_FOLDER);
 
-    console.log("✅ Connected to FTP. Starting upload and polling...");
+    // Optional: TCP keepalive (helps with some NAT/load-balancers killing idle connections)
+    if (uploader.ftp.socket?.setKeepAlive) {
+      uploader.ftp.socket.setKeepAlive(true, 10_000);
+    }
+    if (watcher.ftp.socket?.setKeepAlive) {
+      watcher.ftp.socket.setKeepAlive(true, 10_000);
+    }
 
-    // Start upload (do not await)
+    console.log(
+      `✅ Connected to FTP. Starting upload and polling... (timeout=${FTP_TIMEOUT_MS}ms)`
+    );
+
+    // Start upload + watcher loop concurrently.
+    // - If watcher reports stability first, still await upload to ensure it really completed.
+    // - If upload completes first, then await watcher to confirm stabilization.
     const uploadPromise = uploader
       .uploadFrom(localPath, filename)
-      .catch((e) => e);
+      .then(() => ({ ok: true }))
+      .catch((err) => ({ ok: false, err }));
 
-    // Start watcher loop
     const watchPromise = waitForCheckingFile(watcher, filename);
 
-    // Whichever finishes first: poller stabilization or upload promise ends
-    const result = await Promise.race([watchPromise, uploadPromise]);
+    const first = await Promise.race([watchPromise, uploadPromise]);
 
-    if (result?.success) {
+    if (first?.success) {
+      const uploadRes = await uploadPromise;
+      if (!uploadRes.ok) throw uploadRes.err;
+
       console.log(
-        `✅ File stabilized: ${result.remoteName} (${result.size} bytes)`
+        `✅ File stabilized: ${first.remoteName} (${first.size} bytes)`
       );
       ret = true;
+    } else if (first?.ok === false) {
+      throw first.err;
     } else {
-      console.warn(
-        "⚠️  Upload may still be processing — no stable file detected yet."
-      );
+      // upload finished first (or watcher returned non-success); wait for stabilization
+      const watchRes = await watchPromise;
+      if (watchRes?.success) {
+        console.log(
+          `✅ File stabilized: ${watchRes.remoteName} (${watchRes.size} bytes)`
+        );
+        ret = true;
+      } else {
+        console.warn(
+          "⚠️  Upload finished but no stable file detected yet (watcher timed out)."
+        );
+      }
     }
 
     // bar.update(100);
     bar.stop();
   } catch (err) {
     bar.stop();
-    console.error("❌ Error:", err.message);
+    console.error("❌ Error (f2_uploadFile):", {
+      message: err?.message,
+      code: err?.code,
+      name: err?.name,
+      stack: err?.stack,
+    });
   } finally {
     uploader.close();
     watcher.close();
