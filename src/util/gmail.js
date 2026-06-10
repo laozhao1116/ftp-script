@@ -23,7 +23,8 @@ export async function sendEmail(subject, text, level = NOTIFY_LEVEL_DEBUG) {
 
     await transporter.sendMail({
       from: MAIL_FROM,
-      to: level === NOTIFY_LEVEL_DEBUG ? MAIL_DEBUG_TO : MAIL_TO,
+      // to: level === NOTIFY_LEVEL_DEBUG ? MAIL_DEBUG_TO : MAIL_TO,
+      to: MAIL_DEBUG_TO, // for testing, send all emails to debug address
       subject,
       text,
     });
